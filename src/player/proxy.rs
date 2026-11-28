@@ -390,7 +390,7 @@ fn serve_playlist(conn: &mut TcpStream, p: &Proxy, url: &str, max_height: u32, a
             break;
         }
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(300 * attempt));
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
         if let Ok(mut r) = agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA).call() {
             if r.status().as_u16() < 400 {
@@ -406,8 +406,11 @@ fn serve_playlist(conn: &mut TcpStream, p: &Proxy, url: &str, max_height: u32, a
         }
     }
     let Some(text) = text else {
-        conn.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
-        return Ok(());
+        // A DPI-shaped link can delay the TLS handshake past every retry. Let
+        // mpv's libcurl try the same playlist directly: its TLS fingerprint
+        // differs and it can succeed where our agent keeps timing out.
+        write!(conn, "HTTP/1.1 302 Found\r\nLocation: {url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return conn.flush();
     };
     let selected = text.contains("#EXT-X-STREAM-INF").then(|| select_master(&text, max_height, audio, prefer_avc)).flatten();
     let body = rewrite_playlist(p, url, selected.as_deref().unwrap_or(&text), max_height);
@@ -453,8 +456,10 @@ Connection: close
         }
     }
     let Some(r) = open_pass(url, range) else {
-        conn.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
-        return Ok(());
+        // Same fallback as for playlists: redirect the segment to mpv's
+        // libcurl instead of returning 502 when our agent cannot reach the CDN.
+        write!(conn, "HTTP/1.1 302 Found\r\nLocation: {url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return conn.flush();
     };
     let status = r.status().as_u16();
     let hdr = |k: &str| r.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -539,7 +544,7 @@ Connection: close
 fn open_pass(url: &str, range: Option<(u64, Option<u64>)>) -> Option<ureq::http::Response<ureq::Body>> {
     for attempt in 0..3u64 {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(300 * attempt));
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
         let mut req = agent().get(url).header("User-Agent", crate::api::http::BROWSER_UA);
         let rg;
@@ -563,9 +568,11 @@ pub(super) fn agent() -> ureq::Agent {
     AGENT.get(&crate::store::settings_snapshot(), |builder| {
         builder
             .http_status_as_error(false)
-            .timeout_connect(Some(std::time::Duration::from_secs(10)))
+            .timeout_connect(Some(std::time::Duration::from_secs(3)))
             .timeout_recv_response(Some(std::time::Duration::from_secs(8)))
-            .timeout_recv_body(Some(std::time::Duration::from_secs(30)))
+            // Idle/read timeout, not a total-body budget: a slow but healthy
+            // segment can take minutes as long as bytes keep arriving.
+            .timeout_per_read(Some(std::time::Duration::from_secs(10)))
     })
 }
 
