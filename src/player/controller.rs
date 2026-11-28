@@ -408,6 +408,11 @@ impl Player {
         }
         let refs: Vec<(&str, &str)> = opts_owned.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
         let t_init = std::time::Instant::now();
+        #[cfg(windows)]
+        let created = Mpv::new_gpu(&refs, move |ev| {
+            let _ = tx.unbounded_send(ev);
+        });
+        #[cfg(not(windows))]
         let created = Mpv::new(&refs, move |ev| {
             let _ = tx.unbounded_send(ev);
         });

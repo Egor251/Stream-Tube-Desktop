@@ -20,6 +20,16 @@ struct mpv_render_param {
 }
 
 #[repr(C)]
+struct mpv_d3d11_init_params {
+    device: *mut c_void,
+}
+
+#[repr(C)]
+struct mpv_d3d11_fbo {
+    tex: *mut c_void,
+}
+
+#[repr(C)]
 struct mpv_event {
     event_id: c_int,
     error: c_int,
@@ -121,6 +131,10 @@ const RP_SW_SIZE: c_int = 17;
 const RP_SW_FORMAT: c_int = 18;
 const RP_SW_STRIDE: c_int = 19;
 const RP_SW_POINTER: c_int = 20;
+const RP_D3D11_INIT_PARAMS: c_int = 21;
+const RP_D3D11_FBO: c_int = 22;
+const RP_RENDERER: c_int = 23;
+const API_D3D11: &str = "d3d11";
 const RENDER_UPDATE_FRAME: u64 = 1;
 const FRAME_PRESENT: u64 = 1;
 const FRAME_REDRAW: u64 = 2;
@@ -509,14 +523,26 @@ struct Block([u8; 64]);
 impl Mpv {
     /// Creates a player. `events` receives property changes and frame notifications.
     pub fn new(options: &[(&str, &str)], events: impl Fn(MpvEvent) + Send + Sync + 'static) -> Result<Arc<Self>> {
+        Self::new_inner(options, events, false)
+    }
+
+    /// Renders with mpv's D3D11 render API into a texture, then reads it back
+    /// as BGRA for GPUI. No child window: overlays and input stay in one HWND.
+    #[cfg(windows)]
+    pub fn new_gpu(options: &[(&str, &str)], events: impl Fn(MpvEvent) + Send + Sync + 'static) -> Result<Arc<Self>> {
+        Self::new_inner(options, events, true)
+    }
+
+    fn new_inner(options: &[(&str, &str)], events: impl Fn(MpvEvent) + Send + Sync + 'static, gpu: bool) -> Result<Arc<Self>> {
         let (_, f) = lib()?;
         let events = Arc::new(events);
+        let opts: Vec<(&str, &str)> = options.to_vec();
         unsafe {
             let h = (f.create)();
             if h.is_null() {
                 return Err(anyhow!("mpv_create failed"));
             }
-            for (k, v) in options {
+            for (k, v) in &opts {
                 let k = CString::new(*k)?;
                 let v = CString::new(*v)?;
                 (f.set_option_string)(h, k.as_ptr(), v.as_ptr());
@@ -538,13 +564,22 @@ impl Mpv {
                 stop: AtomicBool::new(false),
                 force: AtomicBool::new(false),
             });
-            // render context
-            let api = CString::new("sw")?;
-            let mut params = [
-                mpv_render_param { kind: RP_API_TYPE, data: api.as_ptr() as *mut c_void },
-                mpv_render_param { kind: 0, data: std::ptr::null_mut() },
-            ];
             let mut rctx: *mut mpv_render_context = std::ptr::null_mut();
+            #[cfg(windows)]
+            let gpu_state = if gpu { Some(super::gpu::GpuState::new(1920, 1080)?) } else { None };
+            #[cfg(not(windows))]
+            let gpu_state: Option<()> = None;
+            let api = CString::new(if gpu { API_D3D11 } else { "sw" })?;
+            let renderer = CString::new("gpu-next")?;
+            let mut init = gpu_state.as_ref().map(|g| mpv_d3d11_init_params { device: g.device_ptr() });
+            let mut params = vec![
+                mpv_render_param { kind: RP_API_TYPE, data: api.as_ptr() as *mut c_void },
+            ];
+            if let Some(i) = init.as_mut() {
+                params.push(mpv_render_param { kind: RP_D3D11_INIT_PARAMS, data: i as *mut _ as *mut c_void });
+                params.push(mpv_render_param { kind: RP_RENDERER, data: renderer.as_ptr() as *mut c_void });
+            }
+            params.push(mpv_render_param { kind: 0, data: std::ptr::null_mut() });
             let rc = (f.rc_create)(&mut rctx, h, params.as_mut_ptr());
             if rc < 0 {
                 (f.terminate_destroy)(h);
@@ -631,6 +666,7 @@ impl Mpv {
             let r = render.clone();
             let frame_cb = events.clone();
             let rc_ptr = RenderCtx(rctx);
+            let gpu_state = gpu_state;
             let t2 = std::thread::Builder::new().name("mpv-render".into()).spawn(move || {
                 let rc_ptr = rc_ptr;
                 let (_, f) = lib().unwrap();
@@ -651,6 +687,41 @@ impl Mpv {
                     let flags = (f.rc_update)(rc_ptr.0);
                     let forced = r.force.swap(false, Ordering::Relaxed);
                     if flags & RENDER_UPDATE_FRAME == 0 && !forced {
+                        continue;
+                    }
+                    #[cfg(windows)]
+                    if let Some(g) = gpu_state.as_ref() {
+                        let mut fbo = mpv_d3d11_fbo { tex: g.texture_ptr() };
+                        let mut no_block: c_int = 0;
+                        let mut params = [
+                            mpv_render_param { kind: RP_D3D11_FBO, data: &mut fbo as *mut _ as *mut c_void },
+                            mpv_render_param { kind: RP_BLOCK_FOR_TARGET_TIME, data: &mut no_block as *mut c_int as *mut c_void },
+                            mpv_render_param { kind: 0, data: std::ptr::null_mut() },
+                        ];
+                        let mut info = RenderFrameInfo::default();
+                        let info_param = mpv_render_param {
+                            kind: RP_NEXT_FRAME_INFO,
+                            data: (&mut info as *mut RenderFrameInfo).cast(),
+                        };
+                        let info_result = (f.rc_get_info)(rc_ptr.0, info_param);
+                        let rc = (f.rc_render)(rc_ptr.0, params.as_mut_ptr());
+                        if rc >= 0 {
+                            if let Ok(data) = g.readback() {
+                                let new_picture = if info_result >= 0 {
+                                    info.flags & (FRAME_PRESENT | FRAME_REDRAW | FRAME_REPEAT) == FRAME_PRESENT
+                                } else {
+                                    flags & RENDER_UPDATE_FRAME != 0
+                                };
+                                let picture_serial = if new_picture {
+                                    r.presented_frames.fetch_add(1, Ordering::Relaxed) + 1
+                                } else {
+                                    r.presented_frames.load(Ordering::Relaxed)
+                                };
+                                let (w, h) = g.size();
+                                *r.frame.lock() = Some(VideoFrame { width: w, height: h, data, picture_serial });
+                                frame_cb(MpvEvent::Frame);
+                            }
+                        }
                         continue;
                     }
                     let (tw, th) = *r.target.lock();
